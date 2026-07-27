@@ -545,6 +545,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
+        self.config_name = cfg.get('_mykey_name', '')
         default_context_win = 30000; default_cut_msg_interval = 5
         if 'deepseek' in self.model.lower():
             default_context_win = 70000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
@@ -1135,7 +1136,8 @@ def resolve_client(cfg_name):
     s = resolve_session(cfg_name)
     return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
 
-def fast_ask(prompt, cfg_name):
+def fast_ask(prompt, cfg_name, temperature=None):
     sess = resolve_session(cfg_name)
     if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
+    if temperature is not None: sess.temperature = temperature
     return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))

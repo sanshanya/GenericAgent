@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale, glob
+import os, sys, threading, queue, time, json, re, random, locale, glob, shutil
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -6,12 +6,12 @@ if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
+from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client, fast_ask
 from agent_loop import agent_runner_loop
 try:
     from plugins.hooks import discover_and_load; discover_and_load()
 except Exception: pass
-from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
+from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file, memory_root
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
@@ -23,8 +23,16 @@ def load_tool_schema(suffix=''):
 load_tool_schema()
 
 lang_suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
-mem_dir = os.path.join(script_dir, 'memory')
-if not os.path.exists(mem_dir): os.makedirs(mem_dir)
+mem_dir = memory_root
+bundled_memory = os.path.join(script_dir, 'memory')
+if os.path.abspath(mem_dir) != os.path.abspath(bundled_memory):
+    for source_dir, _, files in os.walk(bundled_memory):
+        target_dir = os.path.join(mem_dir, os.path.relpath(source_dir, bundled_memory))
+        os.makedirs(target_dir, exist_ok=True)
+        for name in files:
+            source, target = os.path.join(source_dir, name), os.path.join(target_dir, name)
+            if not os.path.exists(target): shutil.copy2(source, target)
+os.makedirs(mem_dir, exist_ok=True)
 mem_txt = os.path.join(mem_dir, 'global_mem.txt')
 if not os.path.exists(mem_txt): open(mem_txt, 'w', encoding='utf-8').write('# [Global Memory - L2]\n')
 mem_insight = os.path.join(mem_dir, 'global_mem_insight.txt')
@@ -106,6 +114,11 @@ class GenericAgent:
         return f"{type(b.backend).__name__.replace('Session', '')}/{b.backend.name}"
     def get_ctx_multiplier(self): return getattr(self.llmclient.backend, 'maxlen_multiplier', 1.0)
 
+    def model_call(self, prompt, temperature=0):
+        config_name = getattr(self.llmclient.backend, 'config_name', '')
+        if not config_name: raise RuntimeError('Current GA model has no reusable config name')
+        return fast_ask(prompt, config_name, temperature=temperature)
+
     def abort(self):
         if not self.is_running: return
         print('Abort current task...')
@@ -133,6 +146,85 @@ class GenericAgent:
             return r'帮我看看最近有哪些会话可以恢复。读model_responses/目录，按修改时间取最近10个文件，从每个文件里找最后一个<history>...</history>块，用一句话总结每个会话在聊什么，列表给我选。注意读文件后要把字面的\n替换成真换行才能正确匹配。'
         return raw_query
 
+    @staticmethod
+    def _prepare_task_input(query, history_content, cwd):
+        original = history_content if history_content is not None else query
+        compact = smart_format(original.replace('\n', ' '), max_str_len=200)
+        history = (
+            f"[USER] [preview; original {len(original)} chars]: {compact}"
+            if compact != original.replace('\n', ' ')
+            else f"[USER]: {compact}"
+        )
+        if len(query) <= 2000: return query, history
+        os.makedirs(cwd, exist_ok=True)
+        task_file = os.path.join(cwd, f'user_prompt_{os.getpid()}_{time.time_ns()}.md')
+        with open(task_file, 'w', encoding='utf-8') as f: f.write(query)
+        return f'Long user prompt saved to {task_file}. Read and execute.', history
+
+    def execute_task(self, query, *, handler_class=GenericAgentHandler, cwd=None,
+                     extra_system_prompt='', history_content=None, max_turns=180,
+                     initial_user_content=None, yield_info=True, on_chunk=None):
+        """Execute one task while preserving GenericAgent's native cognitive state."""
+        self.is_running, self.stop_sig = True, False
+        handler = gen = None
+        try:
+            cwd = os.path.abspath(cwd or os.path.join(script_dir, 'temp'))
+            prepared, history = self._prepare_task_input(query, history_content, cwd)
+            self.history.append(history)
+            if initial_user_content is None or initial_user_content == query:
+                initial_user_content = prepared
+            sys_prompt = get_system_prompt()
+            sys_prompt += f'\nCurrent tool cwd: {cwd} (./)\n'
+            if extra_system_prompt: sys_prompt += '\n' + extra_system_prompt
+            sys_prompt += '\n'.join(self.extra_sys_prompts)
+            sys_prompt += getattr(self.llmclient.backend, 'extra_sys_prompt', '')
+            if self.peer_hint:
+                sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
+            handler = handler_class(self, self.history, cwd)
+            if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
+            if self.handler and 'key_info' in self.handler.working:
+                ki = re.sub(r'\n\[SYSTEM\] 此为.*?工作记忆[。\n]*', '', self.handler.working['key_info'])
+                handler.working['key_info'] = ki
+                handler.working['passed_sessions'] = ps = self.handler.working.get('passed_sessions', 0) + 1
+                if ps > 0: handler.working['key_info'] += f'\n[SYSTEM] 此为 {ps} 个对话前设置的key_info，若已在新任务，先更新或清除工作记忆。\n'
+            self.handler = handler
+            self.llmclient.log_path = self.log_path
+            if self.force_non_stream:
+                self.llmclient.backend.stream = False
+                self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
+            gen = agent_runner_loop(
+                self.llmclient, sys_prompt, prepared, handler, TOOLS_SCHEMA,
+                max_turns=max_turns, verbose=self.verbose,
+                initial_user_content=initial_user_content, yield_info=yield_info,
+            )
+            loop_result = None; aborted = self.stop_sig
+            while not aborted:
+                try: chunk = next(gen)
+                except StopIteration as stopped:
+                    loop_result = stopped.value
+                    break
+                if on_chunk: on_chunk(chunk)
+                aborted = self.stop_sig
+            self.history = handler.history_info
+            outcome = loop_result.get('result', '') if isinstance(loop_result, dict) else ''
+            interrupt = loop_result.get('data') if outcome == 'EXITED' else None
+            return {
+                'loop_result': loop_result,
+                'outcome': outcome,
+                'terminal_text': getattr(handler, 'terminal_text', ''),
+                'interrupt': interrupt,
+                'aborted': aborted,
+            }
+        finally:
+            try:
+                if gen is not None: gen.close()
+            finally:
+                try:
+                    if handler is not None and hasattr(handler, 'finish_task'): handler.finish_task()
+                finally:
+                    self.is_running = self.stop_sig = False
+                    if handler is not None: handler.code_stop_signal.append(1)
+
     def run(self):
         while True:
             task = self.task_queue.get()
@@ -141,54 +233,29 @@ class GenericAgent:
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:
                 self.task_queue.task_done(); continue
-            self.is_running = True
-            if len(raw_query) > 2000:
-                task_file = os.path.join(script_dir, 'temp', f'user_prompt_{os.getpid()}_{time.time_ns()}.md')
-                with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
-                raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
-            rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
-            self.history.append(f"[USER]: {rquery}")
-            sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
-            if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
-            handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
-            if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
-            if self.handler and 'key_info' in self.handler.working: 
-                ki = re.sub(r'\n\[SYSTEM\] 此为.*?工作记忆[。\n]*', '', self.handler.working['key_info'])  # 去旧
-                handler.working['key_info'] = ki
-                handler.working['passed_sessions'] = ps = self.handler.working.get('passed_sessions', 0) + 1
-                if ps > 0: handler.working['key_info'] += f'\n[SYSTEM] 此为 {ps} 个对话前设置的key_info，若已在新任务，先更新或清除工作记忆。\n'
-            self.handler = handler  # although new handler, the **full** history is in llmclient, so it is full history!
-            self.llmclient.log_path = self.log_path
-            if self.force_non_stream:
-                self.llmclient.backend.stream = False
-                self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
-            gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=180, verbose=self.verbose, yield_info=True)
             try:
                 full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
-                for chunk in gen:
-                    if consume_file(self.task_dir, '_stop'): self.abort() 
-                    if self.stop_sig: break
+                def on_chunk(chunk):
+                    nonlocal full_resp, last_pos, curr_turn
+                    if consume_file(self.task_dir, '_stop'): self.abort()
                     if isinstance(chunk, dict) and 'turn' in chunk: 
-                        curr_turn = chunk['turn']; turn_resps.append(''); continue
+                        curr_turn = chunk['turn']; turn_resps.append(''); return
                     full_resp += chunk;  turn_resps[-1] += chunk
                     if len(full_resp) - last_pos > 30 or 'LLM Running' in chunk:
                         display_queue.put({'next': full_resp[last_pos:] if self.inc_out else full_resp, 
                                            'source': source, 'turn': curr_turn, 'outputs': turn_resps[-2:]})
                         last_pos = len(full_resp)
+                execution = self.execute_task(raw_query, yield_info=True, on_chunk=on_chunk)
                 if self.inc_out and last_pos < len(full_resp):
                     display_queue.put({'next': full_resp[last_pos:], 'source': source,
                                     'turn': curr_turn, 'outputs': turn_resps[-2:]})
                 display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
-                self.history = handler.history_info
+                if execution['aborted']: print('User aborted the task.')
             except Exception as e:
                 print(f"Backend Error: {format_error(e)}")
                 display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
             finally:
-                if self.stop_sig: print('User aborted the task.')
-                self.is_running = self.stop_sig = False
                 self.task_queue.task_done()
-                if self.handler is not None: self.handler.code_stop_signal.append(1)
 
 GeneraticAgent = GenericAgent
 

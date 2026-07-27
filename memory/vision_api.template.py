@@ -11,6 +11,7 @@ from pathlib import Path
 # 不同中转的 apibase/endpoint 可能不同，按实际状态码和响应结构修正。
 CLAUDE_CONFIG_KEY = 'claude_config141'   # mykey.py 中 Claude 配置的变量名
 OPENAI_CONFIG_KEY = 'oai_config1'        # mykey.py 中 OpenAI 配置的变量名
+# 可选：GA_VISION_LLM_NO=1 时按 GenericAgent 的第 1 个 provider 取 OpenAI 兼容配置；未设置时继续使用 OPENAI_CONFIG_KEY。
 MODELSCOPE_API_KEY = ''                  # 直接填你的 ModelScope token
 DEFAULT_BACKEND = 'claude'               # 默认后端: 'claude' / 'openai' / 'modelscope'
 # =================================================================
@@ -31,8 +32,7 @@ def ask_vision(image_input, prompt="详细描述这张图片的内容", timeout=
         if backend == 'claude':
             return _call_claude(b64, prompt, timeout)
         elif backend == 'openai':
-            mk = _load_config()
-            cfg = getattr(mk, OPENAI_CONFIG_KEY)
+            cfg = _openai_config()
             return _call_openai_compat(
                 b64, prompt, timeout,
                 apibase=cfg['apibase'], apikey=cfg['apikey'], model=cfg['model'], proxy=cfg.get('proxy')
@@ -66,7 +66,7 @@ def _prepare_image(image_input, max_pixels=1440000):
         scale = (max_pixels / (w * h)) ** 0.5
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        print(f"  📐 缩放: {w}×{h} → {new_w}×{new_h}")
+        print(f"  resized image: {w}x{h} -> {new_w}x{new_h}")
     if img.mode in ('RGBA', 'LA', 'P'):
         rgb = Image.new('RGB', img.size, (255, 255, 255))
         rgb.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
@@ -74,12 +74,41 @@ def _prepare_image(image_input, max_pixels=1440000):
     buf = BytesIO()
     img.save(buf, format='JPEG', quality=80, optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    print(f"  📦 Base64: {len(buf.getvalue())/1024:.1f}KB")
+    print(f"  encoded image: {len(buf.getvalue())/1024:.1f}KB")
     return b64
 
 def _load_config():
+    _ensure_ga_root()
     import mykey
     return mykey
+
+def _ensure_ga_root():
+    ga_root = os.getenv('GA_ROOT', '').strip()
+    if not ga_root:
+        return
+    ga_root = os.path.abspath(ga_root)
+    if ga_root not in sys.path:
+        sys.path.insert(0, ga_root)
+
+def _openai_config():
+    selected = os.getenv('GA_VISION_LLM_NO', '').strip()
+    if not selected:
+        return getattr(_load_config(), OPENAI_CONFIG_KEY)
+    try:
+        llm_no = int(selected)
+    except ValueError as e:
+        raise ValueError(f"GA_VISION_LLM_NO must be an integer, got {selected!r}") from e
+    _ensure_ga_root()
+    from agentmain import GenericAgent
+    agent = GenericAgent()
+    if not 0 <= llm_no < len(agent.llmclients):
+        raise ValueError(f"GA_VISION_LLM_NO={llm_no} outside configured range")
+    backend = agent.llmclients[llm_no].backend
+    if not all(hasattr(backend, key) for key in ('api_base', 'api_key', 'model')):
+        raise ValueError(f"GA_VISION_LLM_NO={llm_no} is not OpenAI-compatible")
+    proxies = getattr(backend, 'proxies', None)
+    proxy = proxies.get('https') or proxies.get('http') if isinstance(proxies, dict) else None
+    return {'apibase': backend.api_base, 'apikey': backend.api_key, 'model': backend.model, 'proxy': proxy}
 
 def _call_claude(b64, prompt, timeout, max_tokens=1024):
     mk = _load_config()
@@ -101,8 +130,11 @@ def _call_claude(b64, prompt, timeout, max_tokens=1024):
 
 def _call_openai_compat(b64, prompt, timeout, *, apibase, apikey, model, proxy=None):
     proxies = {'https': proxy, 'http': proxy} if proxy else None
+    endpoint = apibase.rstrip('/')
+    if not endpoint.endswith('chat/completions'):
+        endpoint += '/chat/completions' if endpoint.rsplit('/', 1)[-1].startswith('v') else '/v1/chat/completions'
     resp = requests.post(
-        apibase.rstrip('/') + '/v1/chat/completions',   # endpoint按中转实际情况改：有的apibase已含/v1，或路径不同
+        endpoint,
         json={'model': model, 'messages': [{
             'role': 'user',
             'content': [

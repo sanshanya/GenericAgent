@@ -1,10 +1,10 @@
 [
   {"type": "function", "function": {
     "name": "code_run",
-    "description": "Code executor. Prefer python. Multi-call OK, use script param. Reply code block is executed if no script arg; prefer for single call to avoid escaping. No hardcoding bulk data",
+    "description": "Code executor. Use python only for Python source code. Use powershell for CLI or shell commands, including commands that launch python scripts. Multi-call OK, use script param. Reply code block is executed if no script arg; prefer for single call to avoid escaping. No hardcoding bulk data",
     "parameters": {"type": "object", "properties": {
       "script": {"type": "string", "description": "script"},
-      "type": {"type": "string", "enum": ["python", "powershell"], "description": "Code type", "default": "python"},
+      "type": {"type": "string", "enum": ["python", "powershell"], "description": "python = Python source; powershell = CLI or shell command", "default": "python"},
       "timeout": {"type": "integer", "description": "in seconds", "default": 60},
       "cwd": {"type": "string", "description": "Working directory, defaults to cwd"},
       "inline_eval": {"type": "boolean", "description": "DO NOT USE except explicitly specified."}}}

@@ -497,6 +497,10 @@ def _openai_stream(sess, messages):
         if sess.reasoning_effort: payload["reasoning_effort"] = sess.reasoning_effort
     tools = getattr(sess, 'tools', None)
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
+    if tool_choice := getattr(sess, 'tool_choice', None):
+        if api_mode == "responses" and "function" in tool_choice:
+            tool_choice = {"type": "function", "name": tool_choice["function"]["name"]}
+        payload["tool_choice"] = tool_choice
     if sess.service_tier: payload["service_tier"] = sess.service_tier
     parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
     return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
@@ -599,6 +603,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
+        self.config_name = cfg.get('_mykey_name', '')
         default_context_win = 35000; default_cut_msg_interval = 5
         if 'deepseek' in self.model.lower():
             default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
@@ -1190,7 +1195,8 @@ def resolve_client(cfg_name):
     s = resolve_session(cfg_name)
     return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
 
-def fast_ask(prompt, cfg_name):
+def fast_ask(prompt, cfg_name, temperature=None):
     sess = resolve_session(cfg_name)
     if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
+    if temperature is not None: sess.temperature = temperature
     return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))

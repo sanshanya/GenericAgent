@@ -8,6 +8,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent_loop import BaseHandler, StepOutcome, json_default
 script_dir = os.path.dirname(os.path.abspath(__file__))
+memory_root = os.path.abspath(os.getenv('GA_MEMORY_ROOT', os.path.join(script_dir, 'memory')))
+_INLINE_EVAL_LOCK = threading.Lock()
+_MEMORY_SETTLEMENT_LOCK = threading.Lock()
+
+def bind_memory_paths(text):
+    """Bind native memory references to this GenericAgent checkout."""
+    root = Path(memory_root).as_posix()
+    return text.replace('../memory', root).replace('./memory', root)
 
 def safe_print(*args, **kwargs):
     try: print(*args, **kwargs)
@@ -157,7 +165,7 @@ def format_error(e):
 
 def log_memory_access(path):
     if 'memory' not in path: return
-    stats_file = os.path.join(script_dir, 'memory/file_access_stats.json')
+    stats_file = os.path.join(memory_root, 'file_access_stats.json')
     try:
         with open(stats_file, 'r', encoding='utf-8') as f: stats = json.load(f)
     except: stats = {}
@@ -286,6 +294,8 @@ class GenericAgentHandler(BaseHandler):
         self.history_info = last_history if last_history else []
         self.code_stop_signal = []
         self._done_hooks = []
+        self._memory_settlement_locked = False
+        self.terminal_text = ""
         self.print = safe_print
 
     def _get_tool_maxlen(self, l, args, growth_rate=1.0):
@@ -314,15 +324,16 @@ class GenericAgentHandler(BaseHandler):
         maxlen = self._get_tool_maxlen(10000, args)
         if timeout > 600: result = '[ERROR] Timeout must be <= 600 seconds; code not executed. Run time-consuming code in the background instead of waiting for it to finish in the foreground, verify it started successfully, and monitor it until completion or failure.'
         elif code_type == 'python' and _arg(args, "inline_eval", False, bool):
-            ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(cwd)
+            with _INLINE_EVAL_LOCK:
+                ns = {'handler':self, 'parent':self.parent, 'history':json.dumps(self.parent.llmclient.backend.history)}
+                old_cwd = os.getcwd()
                 try:
-                    try: result = repr(eval(code, ns))
-                    except SyntaxError: exec(code, ns); result = ns.get('_r', 'OK')
-                except Exception as e: result = f'Error: {e}'
-            finally: os.chdir(old_cwd)
+                    os.chdir(cwd)
+                    try:
+                        try: result = repr(eval(code, ns))
+                        except SyntaxError: exec(code, ns); result = ns.get('_r', 'OK')
+                    except Exception as e: result = f'Error: {e}'
+                finally: os.chdir(old_cwd)
         else: result = yield from code_run(code, code_type, timeout, cwd, code_cwd=code_cwd, stop_signal=self.code_stop_signal, maxlen=maxlen, myprint=self.print)
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         return StepOutcome(result, next_prompt=next_prompt)
@@ -331,6 +342,9 @@ class GenericAgentHandler(BaseHandler):
         question = args.get("question", "请提供输入：")
         candidates = args.get("candidates", [])
         result = ask_user(question, candidates)
+        self.terminal_text = question + (
+            "\n" + "\n".join(f"- {item}" for item in candidates) if candidates else ""
+        )
         yield f"Waiting for your answer ...\n"
         return StepOutcome(result, next_prompt="", should_exit=True)
     
@@ -525,6 +539,9 @@ class GenericAgentHandler(BaseHandler):
         return StepOutcome(response, next_prompt=None)
     
     def do_start_long_term_update(self, args, response):
+        if not self._memory_settlement_locked:
+            _MEMORY_SETTLEMENT_LOCK.acquire()
+            self._memory_settlement_locked = True
         '''Agent觉得当前任务完成后有重要信息需要记忆时调用此工具。'''
         prompt = '''### [总结提炼经验] 既然你觉得当前任务有重要信息需要记忆，请提取最近一次任务中【事实验证成功且长期有效】的环境事实、用户偏好、重要步骤，更新记忆。
 本工具是标记开启结算过程，若已在更新记忆过程或没有值得记忆的点，忽略本次调用。
@@ -536,11 +553,15 @@ class GenericAgentHandler(BaseHandler):
 **操作**：严格遵循提供的L0的记忆更新SOP。先 `file_read` 看现有 → 判断类型 → 最小化更新 → 无新内容跳过，保证对记忆库最小局部修改。\n
 ''' + get_global_memory()
         yield "[Info] Start distilling good memory for long-term storage.\n"
-        path = './memory/memory_management_sop.md'
-        if os.path.exists(path): result = 'This is L0:\n' + file_read(path, show_linenos=False)
+        path = os.path.join(memory_root, 'memory_management_sop.md')
+        if os.path.exists(path): result = 'This is L0:\n' + bind_memory_paths(file_read(path, show_linenos=False))
         else: result = "Memory Management SOP not found. Do not update memory."
-        if self.current_turn < 10: result, prompt = 'start_long_term_update is only used after completing a long turn task!', '\n'
         return StepOutcome(result, next_prompt=prompt)
+
+    def finish_task(self):
+        if self._memory_settlement_locked:
+            self._memory_settlement_locked = False
+            _MEMORY_SETTLEMENT_LOCK.release()
 
     def _fold_earlier(self, lines):
         FALLBACK = '直接回答了用户问题'
@@ -569,6 +590,11 @@ class GenericAgentHandler(BaseHandler):
         return prompt
     
     def turn_end_callback(self, response, tool_calls, tool_results, turn, next_prompt, exit_reason):
+        if exit_reason and not self.terminal_text:
+            self.terminal_text = re.sub(
+                r"<(?:thinking|summary)>[\s\S]*?</(?:thinking|summary)>",
+                "", response.content, flags=re.IGNORECASE
+            ).strip()
         _c = re.sub(r'```.*?```|<thinking>.*?</thinking>', '', response.content, flags=re.DOTALL)
         rsumm = re.search(r"<summary>(.*?)</summary>", _c, re.DOTALL)
         if rsumm: summary = rsumm.group(1).strip()
@@ -604,11 +630,11 @@ def get_global_memory():
     prompt = "\n"
     try:
         suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
-        with open(os.path.join(script_dir, 'memory/global_mem_insight.txt'), 'r', encoding='utf-8', errors='replace') as f: insight = f.read()
-        with open(os.path.join(script_dir, f'assets/insight_fixed_structure{suffix}.txt'), 'r', encoding='utf-8') as f: structure = f.read()
-        prompt += f'cwd = {os.path.join(script_dir, "temp")} (./)\n'
-        prompt += f"\n[Memory] (../memory)\n"
-        prompt += structure + '\n../memory/global_mem_insight.txt:\n'
+        insight_path = os.path.join(memory_root, 'global_mem_insight.txt')
+        with open(insight_path, 'r', encoding='utf-8', errors='replace') as f: insight = bind_memory_paths(f.read())
+        with open(os.path.join(script_dir, f'assets/insight_fixed_structure{suffix}.txt'), 'r', encoding='utf-8') as f: structure = bind_memory_paths(f.read())
+        prompt += f"\n[Memory] ({Path(memory_root).as_posix()})\n"
+        prompt += structure + f'\n{Path(insight_path).as_posix()}:\n'
         prompt += insight + "\n"
     except FileNotFoundError: pass
     return prompt

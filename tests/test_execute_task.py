@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -43,6 +44,43 @@ def fake_agent():
 
 
 class ExecuteTaskTests(unittest.TestCase):
+    def test_inject_intervene_uses_native_boundary_without_history_mutation(self):
+        agent = fake_agent()
+        agent.task_dir = tempfile.mkdtemp()
+        agent._intervention_lock = threading.Lock()
+        agent._intervention_pending = []
+        agent._intervention_replay = []
+        agent.is_running = True
+
+        self.assertTrue(agent.inject_intervene("please reassess"))
+        self.assertEqual(
+            Path(agent.task_dir, "_intervene").read_text(encoding="utf-8"),
+            "please reassess\n\n",
+        )
+        self.assertEqual(agent.history, [])
+
+        agent._track_intervention_boundary(
+            {"turn": 1, "exit_reason": {"result": "EXITED"}, "handler": SimpleNamespace(max_turns=180)}
+        )
+        self.assertEqual(agent._intervention_replay, ["please reassess"])
+
+    def test_execute_task_returns_boundary_race_as_replay(self):
+        agent = fake_agent()
+        agent.task_dir = tempfile.mkdtemp()
+
+        def loop(_client, _system, _query, _handler, _schema, **_kwargs):
+            self.assertTrue(agent.inject_intervene("continue with the new constraint"))
+            if False:
+                yield
+            return {"result": "EXITED", "data": {"status": "INTERRUPT"}}
+
+        with patch.object(agentmain, "agent_runner_loop", loop), patch.object(
+            agentmain, "get_system_prompt", return_value="base"
+        ):
+            result = agent.execute_task("task", handler_class=Handler)
+
+        self.assertEqual(result["intervention_replay"], ["continue with the new constraint"])
+
     def test_model_call_reuses_config_without_agent_history(self):
         agent = fake_agent()
         agent.llmclient.backend.history = ["unchanged"]

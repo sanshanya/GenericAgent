@@ -8,6 +8,9 @@ The patch owns only reusable GenericAgent seams:
 - `GA_MEMORY_ROOT` for externally owned long-term memory;
 - `execute_task()` with native history, working state, loop, terminal result, interrupt,
   abort and cleanup semantics;
+- `inject_intervene()` for user steering during a running task. It writes the native
+  turn-boundary input seam without editing Agent history; an exit-boundary replay is
+  returned by `execute_task()` for the caller to submit as the next native task;
 - common long-input preparation for native task entry points;
 - the actual tool cwd in the system context;
 - stateless `model_call()` and structured `model_tool_call()` entry points using the

@@ -54,6 +54,10 @@ class GenericAgent:
     def __init__(self):
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
         self.lock = threading.Lock()
+        self._intervention_lock = threading.Lock()
+        self._intervention_pending = []
+        self._intervention_replay = []
+        self._turn_end_hooks = {}
         self.task_dir = None
         self.history = []; self.handler = None; self.all_outputs = []
         self.task_queue = queue.Queue() 
@@ -70,6 +74,46 @@ class GenericAgent:
         self.load_llm_sessions()
         self.extra_sys_prompts = []
         self.intervene = self.extrakeyinfo = None
+
+    def inject_intervene(self, text):
+        """Deliver user steering input at the next native turn boundary.
+
+        This is the same file seam used by the native TUI. It does not append
+        to Agent history or start a second loop. A caller that gets False must
+        submit the text as a normal next task instead.
+        """
+        text = str(text or '').strip()
+        if not text:
+            return False
+        lock = getattr(self, '_intervention_lock', None)
+        if lock is None:
+            lock = self._intervention_lock = threading.Lock()
+        with lock:
+            if not getattr(self, 'is_running', False) or not getattr(self, 'task_dir', None):
+                return False
+            os.makedirs(self.task_dir, exist_ok=True)
+            with open(os.path.join(self.task_dir, '_intervene'), 'a', encoding='utf-8') as stream:
+                stream.write(text + '\n\n')
+            pending = getattr(self, '_intervention_pending', None)
+            if pending is None:
+                pending = self._intervention_pending = []
+            pending.append(text)
+            return True
+
+    def _track_intervention_boundary(self, context):
+        lock = getattr(self, '_intervention_lock', None)
+        if lock is None:
+            return
+        with lock:
+            pending = getattr(self, '_intervention_pending', [])
+            if not pending:
+                return
+            if context.get('exit_reason'):
+                replay = getattr(self, '_intervention_replay', None)
+                if replay is None:
+                    replay = self._intervention_replay = []
+                replay.extend(pending)
+            pending.clear()
 
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
@@ -194,7 +238,11 @@ class GenericAgent:
                      initial_user_content=None, yield_info=True, on_chunk=None):
         """Execute one task while preserving GenericAgent's native cognitive state."""
         self.is_running, self.stop_sig = True, False
-        handler = gen = None
+        handler = gen = result = None
+        hooks = getattr(self, '_turn_end_hooks', None)
+        if hooks is None:
+            hooks = self._turn_end_hooks = {}
+        hooks.setdefault('_generic_agent_intervention', self._track_intervention_boundary)
         try:
             cwd = os.path.abspath(cwd or os.path.join(script_dir, 'temp'))
             prepared, history = self._prepare_task_input(query, history_content, cwd)
@@ -236,13 +284,15 @@ class GenericAgent:
             self.history = handler.history_info
             outcome = loop_result.get('result', '') if isinstance(loop_result, dict) else ''
             interrupt = loop_result.get('data') if outcome == 'EXITED' else None
-            return {
+            result = {
                 'loop_result': loop_result,
                 'outcome': outcome,
                 'terminal_text': getattr(handler, 'terminal_text', ''),
                 'interrupt': interrupt,
                 'aborted': aborted,
+                'intervention_replay': [],
             }
+            return result
         finally:
             try:
                 if gen is not None: gen.close()
@@ -250,7 +300,22 @@ class GenericAgent:
                 try:
                     if handler is not None and hasattr(handler, 'finish_task'): handler.finish_task()
                 finally:
-                    self.is_running = self.stop_sig = False
+                    lock = getattr(self, '_intervention_lock', None)
+                    if lock is None:
+                        lock = self._intervention_lock = threading.Lock()
+                    with lock:
+                        pending = getattr(self, '_intervention_pending', [])
+                        if pending:
+                            replay = getattr(self, '_intervention_replay', None)
+                            if replay is None:
+                                replay = self._intervention_replay = []
+                            replay.extend(pending)
+                            pending.clear()
+                        if result is not None:
+                            replay = getattr(self, '_intervention_replay', [])
+                            result['intervention_replay'] = list(replay)
+                            replay.clear()
+                        self.is_running = self.stop_sig = False
                     if handler is not None: handler.code_stop_signal.append(1)
 
     def run(self):

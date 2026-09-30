@@ -116,6 +116,15 @@ class GenericAgent:
         if self.handler is not None: self.handler.code_stop_signal.append(1)
         for sess in getattr(self.llmclient.backend, '_sessions', [self.llmclient.backend]):
             sess.should_stop = lambda: self.stop_sig  # live read; cleared by run()'s finally
+            try:  # wake a recv() blocked in another thread (waiting headers OR reading stream). Verified on Windows:
+                  # shutdown()/close() do NOT wake it (makefile refcount defers closesocket); _real_close() does
+                import socket as _socket
+                sock = sys.modules['llmcore']._INFLIGHT[sess._tid]  # socket registered at urllib3 request() time, before headers
+                try: sock.shutdown(_socket.SHUT_RDWR)  # for non-Windows semantics
+                except OSError: pass
+                try: sock._real_close()  # CPython internal; bypasses refcount -> actual closesocket
+                except AttributeError: sock.close()
+            except Exception: pass
             try: sess.active_response.close()
             except Exception: pass
             
@@ -296,6 +305,7 @@ if __name__ == '__main__':
             if task and task == '/exit': break
             if task:
                 print(f'[Reflect] triggered: {task[:80]}')
+                if (_ln := getattr(mod, 'LLM', None)): agent.next_llm(next((i for i, b in enumerate(agent.llmclients) if not isinstance(b, dict) and b.backend.name == _ln), agent.llm_no))
                 dq = agent.put_task(task, source='reflect')
                 try:
                     while 'done' not in (item := dq.get(timeout=2200)): pass

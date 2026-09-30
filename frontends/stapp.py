@@ -27,6 +27,20 @@ except ImportError:
 
 st.set_page_config(page_title="Cowork", layout="wide", initial_sidebar_state="collapsed")
 
+def _unbound_ws_queue():
+    # st1.62 starlette server: per-connection send queue is hard-capped at 500 msgs; a burst
+    # of elements (long answer, full repaint) fills it → session treated as disconnected →
+    # script StopException → page stuck on RUNNING forever. Make the queue unbounded.
+    try:
+        import streamlit.web.server.starlette.starlette_websocket as _w
+        from streamlit.runtime import get_instance
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        _w.WEBSOCKET_MAX_SEND_QUEUE_SIZE = 0
+        _i = get_instance()._session_mgr.get_active_session_info(get_script_run_ctx().session_id)
+        if _i and hasattr(_i.client, '_send_queue'): _i.client._send_queue._maxsize = 0
+    except Exception: pass
+_unbound_ws_queue()
+
 st.markdown("""
 <style>
 [data-testid="stBottom"]{position:fixed!important;bottom:0!important;left:0!important;right:0!important;width:100vw!important;z-index:999;background:var(--background-color,#fff)}
@@ -250,12 +264,32 @@ def _step_title(s, j=0):
 def _get_fold_turns(): return lru_cache(maxsize=128)(_fold_turns_impl)
 
 fold_turns = _get_fold_turns()
-def render_segments(segments, suffix=''):
-    for seg in segments:
-        if seg['type'] == 'fold':
-            with st.expander(seg['title'], expanded=False): st.markdown(seg['content'])
+_FOLD_RECENT, _FOLD_GROUP = 50, 30
+def render_folds(folds, key):
+    """folds: [(title, content)]. Last _FOLD_RECENT steps = one expander each; older steps are
+    grouped per _FOLD_GROUP and only sent when the group's toggle is on (keeps element count
+    and browser markdown work bounded on very long answers). Nested expanders are illegal in
+    Streamlit, hence toggle + flat expanders instead of expander-in-expander."""
+    old = max(0, len(folds) - _FOLD_RECENT)
+    for g in range(0, old, _FOLD_GROUP):
+        grp = folds[g:min(g + _FOLD_GROUP, old)]
+        a, b = g + 1, g + len(grp)
+        if st.toggle(f"📚 第 {a}–{b} 步 · {grp[0][0]} → {grp[-1][0]}", key=f"_fg_{key}_{g}"):
+            for t, c in grp:
+                with st.expander(t, expanded=False): st.markdown(c)
         else:
-            st.markdown(seg['content'] + suffix)
+            with st.expander(f"目录（{len(grp)} 步，打开上方开关加载详情）", expanded=False):
+                st.markdown("\n".join(f"{a + j}. {t.replace(chr(10), ' ')}" for j, (t, _) in enumerate(grp)))
+    for t, c in folds[old:]:
+        with st.expander(t, expanded=False): st.markdown(c)
+
+def render_segments(segments, suffix='', key='h'):
+    folds = []
+    for seg in segments:
+        if seg['type'] == 'fold': folds.append((seg['title'], seg['content'])); continue
+        if folds: render_folds(folds, key); folds = []
+        st.markdown(seg['content'] + suffix)
+    if folds: render_folds(folds, key)
 
 def _start_main_task(prompt):
     """Start a task whose queue can be drained across Streamlit reruns."""
@@ -284,16 +318,21 @@ def _poll_main_task(max_items=256):
 
 def _render_stat_badge(is_running):
     if 'task_start_ts' not in st.session_state or not hasattr(llmcore, 'STATS'): return
-    end_ts = time.time() if is_running else st.session_state.get('task_end_ts', time.time())
+    now = time.time()
+    end_ts = now if is_running else st.session_state.get('task_end_ts', now)
     secs = max(0, int(end_ts - st.session_state.task_start_ts))
     stats = dict(llmcore.STATS)
     short = lambda n: f'{n / 1000:.0f}k' if n >= 1000 else str(n)
+    _p = []
+    if stats.get('t_start') and stats.get('t_ttft') is not None and stats['t_ttft'] != stats['t_start']:
+        _p.append(f"ttft{stats['t_ttft'] - stats['t_start']:.1f}s")
+    if stats.get('tps'): _p.append(f"{stats['tps']:.0f}t/s")
+    _tail = (' │ ' + '·'.join(_p)) if _p else ''
     usage = ((f"{stats['session']} │ " if stats.get('session') else '') +
              f"{short(stats['ctx'])} chars·{stats['msgs']}msgs │ "
-             f"in {short(stats.get('inp', 0))} toks·cached{short(stats.get('cached', 0))}·out{short(stats.get('out', 0))} │ "
+             f"in {short(stats.get('inp', 0))} toks·cached{short(stats.get('cached', 0))}·out{short(stats.get('out', 0))}{_tail}"
              if 'ctx' in stats else '')
-    st.markdown(f'<div class="ga-stat-badge">{usage}{secs // 60}:{secs % 60:02d}</div>',
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="ga-stat-badge">{usage} │ {secs // 60}:{secs % 60:02d}</div>', unsafe_allow_html=True)
 
 
 if not hasattr(agent, "_ui_messages"): agent._ui_messages = st.session_state.get("messages", [])
@@ -316,11 +355,11 @@ if len(_msgs) > _HIST_TAIL:
         if st.button(T('hide_earlier'), key="_hide_hist"):
             st.session_state.show_full_history = False
             st.rerun()
-for msg in _msgs:
+for _mi, msg in enumerate(_msgs):
     with st.chat_message(msg["role"]):
         slot = st.empty()
         with slot.container():
-            if msg["role"] == "assistant": render_segments(fold_turns(msg["content"]))
+            if msg["role"] == "assistant": render_segments(fold_turns(msg["content"]), key=f"h{len(st.session_state.messages) - len(_msgs) + _mi}")
             else: st.markdown(msg["content"])
 
 # Scroll-height ghost fix: during streaming, expander open/close mid-animation can leave
@@ -359,6 +398,7 @@ if prompt:
         st.session_state.reply_ts = ""
         st.session_state.current_prompt = ""
         st.session_state.last_reply_time = int(time.time())
+        st.session_state.show_full_history = False
         st.rerun()
     def _slash_missing(name):
         st.session_state.messages.extend([
@@ -379,6 +419,11 @@ if prompt:
         target = sessions[idx][0] if 0 <= idx < len(sessions) else None
         result = handle_frontend_command(agent, cmd)
         history = extract_ui_messages(target) if target and result.startswith('✅') else None
+        if history:
+            for x in history:
+                if x['role'] == 'assistant' and len(x['content']) > 120_000:
+                    m = re.search(r'\**LLM Running \(Turn \d+\) \.\.\.\**', x['content'][-120_000:])
+                    x['content'] = x['content'][-120_000 + m.start():] if m else ''
         tail = [{"role": "assistant", "content": result, "time": ts}]
         if history: st.session_state.messages[:] = history + tail
         else: st.session_state.messages.extend([{"role": "user", "content": cmd, "time": ts}] + tail)
@@ -472,9 +517,7 @@ def _tick():
         # bubble (expanders + live tail) is re-emitted from state every tick,
         # so a rerun can neither drop nor duplicate elements.
         with st.chat_message("assistant"):
-            for i in range(max(0, len(steps) - 1)):
-                body = steps[i] or ''
-                with st.expander(_step_title(body, i), expanded=False): st.markdown(body)
+            render_folds([(_step_title(steps[i] or '', i), steps[i] or '') for i in range(max(0, len(steps) - 1))], key="live")
             st.markdown(live + " ▌")
         _render_stat_badge(is_running=True)
         return
